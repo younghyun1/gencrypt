@@ -2,6 +2,7 @@
 
 mod crypto;
 
+use mimalloc::MiMalloc;
 use arboard::Clipboard;
 use iced::widget::{
     Space, button, column, container, row, scrollable, text, text_editor, text_input,
@@ -12,6 +13,9 @@ use std::fs;
 use std::path::Path;
 
 use crate::crypto::{decode_custom, decode_custom_bytes, encode_custom, encode_custom_bytes};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Debug, Clone)]
 pub enum Message {

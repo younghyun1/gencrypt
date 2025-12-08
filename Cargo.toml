@@ -1,7 +1,7 @@
 [package]
 edition = "2024"
 name = "gencrypt"
-version = "0.8.1"
+version = "0.9.0"
 description = "Personal usage hashing utility."
 readme = false
 license = "MIT OR Apache-2.0"
@@ -27,3 +27,4 @@ hmac = "0.12.1"
 pbkdf2 = "0.12.2"
 rfd = "0.16.0"
 sha2 = "0.10.9"
+mimalloc = { version = "0.1.48", features = ["v3", "secure"] }
