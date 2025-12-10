@@ -1,19 +1,23 @@
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::{Aead, KeyInit};
+use argon2::Argon2;
 use base64::Engine;
 use base64::engine::general_purpose;
-use hmac::Hmac;
-use pbkdf2::pbkdf2;
 use rand::RngCore;
-use sha2::Sha256;
 use std::io::Cursor;
 use zstd::stream::{decode_all, encode_all};
 
 fn derive_keys(password: &str, salt: &[u8]) -> (u8, u8, u8, [u8; 32]) {
     let mut derived = [0u8; 35];
-    pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, 600_000, &mut derived)
-        .expect("HMAC should not fail");
+
+    // Use default Argon2id parameters (m=19MiB, t=2, p=1)
+    let argon2 = Argon2::default();
+
+    // Derive keys directly into the buffer
+    argon2
+        .hash_password_into(password.as_bytes(), salt, &mut derived)
+        .expect("Argon2 key derivation failed");
 
     let key = derived[0];
     let mix_init = derived[1];
