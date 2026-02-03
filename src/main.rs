@@ -2,12 +2,12 @@
 
 mod crypto;
 
-use mimalloc::MiMalloc;
 use arboard::Clipboard;
 use iced::widget::{
     Space, button, column, container, row, scrollable, text, text_editor, text_input,
 };
 use iced::{Element, Length, Task};
+use mimalloc::MiMalloc;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -31,6 +31,8 @@ pub enum Message {
     SaveFileSelected(std::path::PathBuf, Option<std::path::PathBuf>),
     OperationComplete(Result<String, String>),
     UpdateCryptoResult(u64, Result<(String, std::time::Duration), String>),
+    GeneratePassword,
+    CopyPassword,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +67,63 @@ impl Default for App {
     }
 }
 
+fn validate_password(password: &str) -> Result<(), &'static str> {
+    if password.len() <= 10 {
+        return Err("Password must be > 10 chars");
+    }
+    let mut has_upper = false;
+    let mut has_lower = false;
+    let mut has_number = false;
+    let mut has_special = false;
+
+    for c in password.chars() {
+        if c.is_uppercase() {
+            has_upper = true;
+        } else if c.is_lowercase() {
+            has_lower = true;
+        } else if c.is_numeric() {
+            has_number = true;
+        } else {
+            has_special = true;
+        }
+    }
+
+    if !has_upper {
+        return Err("Password needs uppercase");
+    }
+    if !has_lower {
+        return Err("Password needs lowercase");
+    }
+    if !has_number {
+        return Err("Password needs number");
+    }
+    if !has_special {
+        return Err("Password needs special char");
+    }
+
+    Ok(())
+}
+
+fn generate_secure_password() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let charset =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>?";
+
+    loop {
+        let password: String = (0..20)
+            .map(|_| {
+                let idx = rng.random_range(0..charset.len());
+                charset.chars().nth(idx).unwrap()
+            })
+            .collect();
+
+        if validate_password(&password).is_ok() {
+            return password;
+        }
+    }
+}
+
 impl App {
     fn perform_crypto(&mut self) -> Task<Message> {
         self.is_loading = true;
@@ -78,6 +137,16 @@ impl App {
             Mode::Encrypt => self.plaintext_content.text(),
             Mode::Decrypt => self.ciphertext_content.text(),
         };
+
+        if let Err(e) = validate_password(&password) {
+            self.status = format!("Invalid Password: {}", e);
+            self.is_loading = false;
+            match mode {
+                Mode::Encrypt => self.ciphertext_content = text_editor::Content::new(),
+                Mode::Decrypt => self.plaintext_content = text_editor::Content::new(),
+            }
+            return Task::none();
+        }
 
         if input.is_empty() {
             self.is_loading = false;
@@ -227,6 +296,12 @@ impl App {
             Message::SaveFileSelected(in_path, out_opt) => {
                 if let Some(out_path) = out_opt {
                     let password = self.password.clone();
+
+                    if let Err(e) = validate_password(&password) {
+                        self.status = format!("Cannot process file: Invalid Password ({})", e);
+                        return Task::none();
+                    }
+
                     let mode = self.mode.clone();
 
                     self.status = if mode == Mode::Encrypt {
@@ -304,6 +379,15 @@ impl App {
                     }
                 }
             }
+            Message::GeneratePassword => {
+                self.password = generate_secure_password();
+                return self.perform_crypto();
+            }
+            Message::CopyPassword => {
+                if let Ok(mut clipboard) = Clipboard::new() {
+                    let _ = clipboard.set_text(self.password.clone());
+                }
+            }
         }
         Task::none()
     }
@@ -355,6 +439,13 @@ impl App {
             .secure(true)
             .padding(10);
 
+        let password_row = row![
+            password_input,
+            button("Generate").on_press(Message::GeneratePassword),
+            button("Copy").on_press(Message::CopyPassword),
+        ]
+        .spacing(10);
+
         let top_section = column![
             row![
                 text(input_label).size(16),
@@ -397,7 +488,7 @@ impl App {
         let content = column![
             container(text("GenCrypt").size(24)).center_x(Length::Fill),
             container(toggle_button).center_x(Length::Fill).padding(5),
-            container(password_input).width(Length::Fill).padding(5),
+            container(password_row).width(Length::Fill).padding(5),
             top_section,
             bottom_section,
             container(clear_button).center_x(Length::Fill).padding(5),
