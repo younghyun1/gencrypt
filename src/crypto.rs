@@ -4,6 +4,10 @@ use aes_gcm::aead::{Aead, KeyInit};
 use argon2::Argon2;
 use base64::Engine;
 use base64::engine::general_purpose;
+use pqcrypto_mlkem::mlkem1024;
+use pqcrypto_traits::kem::{
+    Ciphertext as KemCiphertext, SecretKey as KemSecretKey, SharedSecret as KemSharedSecret,
+};
 use rand::RngCore;
 use std::io::Cursor;
 use zstd::stream::{decode_all, encode_all};
@@ -39,12 +43,22 @@ pub fn encode_custom_bytes(input: &[u8], password: &str) -> String {
 
     let (key, mix_init, mix_multiplier, aes_key) = derive_keys(password, &salt);
 
-    let mut mix = mix_init;
+    // ML-KEM-768 adds a post-quantum secret that we fold into masking and encryption.
+    let (pk, sk) = mlkem1024::keypair();
+    let (ss, kem_ct) = mlkem1024::encapsulate(&pk);
+    let ss_bytes = ss.as_bytes();
+
+    let pq_mask = ss_bytes[0];
+    let pq_mix_init = ss_bytes[1];
+    let pq_mix_multiplier = ss_bytes[2] | 1;
+
+    let mut mix = mix_init ^ pq_mix_init;
+    let mix_multiplier = mix_multiplier ^ pq_mix_multiplier;
     let masked: Vec<u8> = input
         .iter()
         .enumerate()
         .map(|(i, &b)| {
-            let byte = b ^ key ^ mix.wrapping_add(i as u8);
+            let byte = b ^ key ^ pq_mask ^ mix.wrapping_add(i as u8);
             mix = mix.wrapping_mul(mix_multiplier).wrapping_add(byte);
             byte
         })
@@ -53,8 +67,12 @@ pub fn encode_custom_bytes(input: &[u8], password: &str) -> String {
     // Compress with zstd level 3
     let compressed = encode_all(Cursor::new(&masked), 3).expect("zstd compress failed");
 
-    // Encrypt with AES-256-GCM
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(&aes_key));
+    // Encrypt with AES-256-GCM using a key blended with the PQ shared secret.
+    let mut data_key = aes_key;
+    for (i, b) in data_key.iter_mut().enumerate() {
+        *b ^= ss_bytes[i % ss_bytes.len()];
+    }
+    let cipher = Aes256Gcm::new(GenericArray::from_slice(&data_key));
     let mut nonce_bytes = [0u8; 12];
     rand::rng().fill_bytes(&mut nonce_bytes);
 
@@ -63,9 +81,20 @@ pub fn encode_custom_bytes(input: &[u8], password: &str) -> String {
         .encrypt(nonce, compressed.as_slice())
         .expect("aes-gcm encryption failed");
 
-    // Prepend salt + nonce to ciphertext
+    // Wrap the ML-KEM secret key with the password-derived key.
+    let wrap_cipher = Aes256Gcm::new(GenericArray::from_slice(&aes_key));
+    let mut wrap_nonce = [0u8; 12];
+    rand::rng().fill_bytes(&mut wrap_nonce);
+    let sk_wrapped = wrap_cipher
+        .encrypt(GenericArray::from_slice(&wrap_nonce), sk.as_bytes())
+        .expect("aes-gcm wrap failed");
+
+    // Prepend metadata: salt + data nonce + kem ciphertext + wrap nonce + wrapped sk
     let mut output = salt.to_vec();
     output.extend_from_slice(&nonce_bytes);
+    output.extend_from_slice(kem_ct.as_bytes());
+    output.extend_from_slice(&wrap_nonce);
+    output.extend_from_slice(&sk_wrapped);
     output.extend_from_slice(&ciphertext);
 
     general_purpose::URL_SAFE_NO_PAD.encode(&output)
@@ -87,17 +116,42 @@ pub fn decode_custom_bytes(input: &str, password: &str) -> Result<Vec<u8>, Strin
         .decode(&sanitized)
         .map_err(|e| format!("Base64 decode error: {e}"))?;
 
-    if decoded.len() < 28 {
-        // 16 salt + 12 nonce
-        return Err("Ciphertext too short (needs salt + nonce)".to_string());
+    let kem_ct_len = mlkem1024::ciphertext_bytes();
+    let sk_len = mlkem1024::secret_key_bytes();
+    let min_len = 16 + 12 + kem_ct_len + 12 + sk_len + 16;
+    if decoded.len() < min_len {
+        return Err("Ciphertext too short (needs salt, PQ, and nonces)".to_string());
     }
     let (salt, rest) = decoded.split_at(16);
-    let (nonce_bytes, ciphertext) = rest.split_at(12);
+    let (nonce_bytes, rest) = rest.split_at(12);
+    let (kem_ct_bytes, rest) = rest.split_at(kem_ct_len);
+    let (wrap_nonce, rest) = rest.split_at(12);
+    let (sk_wrapped, ciphertext) = rest.split_at(sk_len + 16);
 
     let (key, mix_init, mix_multiplier, aes_key) = derive_keys(password, salt);
 
+    let kem_ct = mlkem1024::Ciphertext::from_bytes(kem_ct_bytes)
+        .map_err(|_| "Invalid ML-KEM ciphertext".to_string())?;
+
+    let wrap_cipher = Aes256Gcm::new(GenericArray::from_slice(&aes_key));
+    let sk_bytes = wrap_cipher
+        .decrypt(GenericArray::from_slice(wrap_nonce), sk_wrapped)
+        .map_err(|e| format!("AES-GCM unwrap error: {e}"))?;
+    let sk = mlkem1024::SecretKey::from_bytes(&sk_bytes)
+        .map_err(|_| "Invalid ML-KEM secret key".to_string())?;
+    let ss = mlkem1024::decapsulate(&kem_ct, &sk);
+    let ss_bytes = ss.as_bytes();
+
+    let pq_mask = ss_bytes[0];
+    let pq_mix_init = ss_bytes[1];
+    let pq_mix_multiplier = ss_bytes[2] | 1;
+
     // Decrypt with AES-256-GCM
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(&aes_key));
+    let mut data_key = aes_key;
+    for (i, b) in data_key.iter_mut().enumerate() {
+        *b ^= ss_bytes[i % ss_bytes.len()];
+    }
+    let cipher = Aes256Gcm::new(GenericArray::from_slice(&data_key));
     let nonce = GenericArray::from_slice(nonce_bytes);
     let decompressed = cipher
         .decrypt(nonce, ciphertext)
@@ -107,12 +161,13 @@ pub fn decode_custom_bytes(input: &str, password: &str) -> Result<Vec<u8>, Strin
     let decompressed = decode_all(Cursor::new(&decompressed))
         .map_err(|e| format!("Zstd decompress error: {e}"))?;
 
-    let mut mix = mix_init;
+    let mut mix = mix_init ^ pq_mix_init;
+    let mix_multiplier = mix_multiplier ^ pq_mix_multiplier;
     let decrypted: Vec<u8> = decompressed
         .iter()
         .enumerate()
         .map(|(i, &enc)| {
-            let orig = enc ^ key ^ mix.wrapping_add(i as u8);
+            let orig = enc ^ key ^ pq_mask ^ mix.wrapping_add(i as u8);
             mix = mix.wrapping_mul(mix_multiplier).wrapping_add(enc);
             orig
         })

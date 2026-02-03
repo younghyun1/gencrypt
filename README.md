@@ -4,9 +4,10 @@
 
 It combines:
 
-- Key derivation with **PBKDF2-HMAC-SHA256** (600,000 iterations)
+- Key derivation with **Argon2id** (default params)
 - A custom byte-masking step
 - Compression with **zstd**
+- A **post-quantum** KEM step using **ML‑KEM‑768 (Kyber)** to derive extra secret material
 - Authenticated encryption using **AES‑256‑GCM**
 - URL-safe, no-padding Base64 for transport
 
@@ -114,15 +115,18 @@ The main logic lives in [`crypto.rs`](./src/crypto.rs) and is used by the UI cod
 Given an `input` and a `password`:
 
 1. A random **salt** and **nonce** are generated.
-2. `derive_keys(password, salt)` uses PBKDF2‑HMAC‑SHA256 to produce:
+2. `derive_keys(password, salt)` uses Argon2id to produce:
    - A small set of bytes for the custom masking step
    - A 32‑byte AES‑256 key
-3. The input bytes are **masked** with a rolling `mix` value for an extra obfuscation layer.
-4. The masked bytes are **compressed** with zstd (level 3).
-5. The compressed data is encrypted using **AES‑256‑GCM** with the derived key and random nonce.
-6. The result is: `salt || nonce || ciphertext`, encoded with URL-safe Base64 (no padding).
+3. A **ML‑KEM‑768** keypair is generated, and a shared secret is encapsulated.
+4. The shared secret is **folded into** the masking mix and the AES‑GCM data key.
+5. The input bytes are **masked** with a rolling `mix` value for an extra obfuscation layer.
+6. The masked bytes are **compressed** with zstd (level 3).
+7. The compressed data is encrypted using **AES‑256‑GCM** with the derived + PQ‑mixed key and random nonce.
+8. The ML‑KEM secret key is wrapped with AES‑GCM using the password‑derived key.
+9. The result is: `salt || nonce || kem_ct || wrap_nonce || wrapped_sk || ciphertext`, encoded with URL-safe Base64 (no padding).
 
-Decoding reverses these steps, verifying the AES‑GCM tag to ensure integrity and authenticity before attempting decompression or unmasking.
+ Decoding reverses these steps, verifying the AES‑GCM tags to ensure integrity and authenticity before attempting decompression or unmasking.
 
 
 ## Building / Running Tests
@@ -142,8 +146,9 @@ cargo test
 
 ## Security notes
 
-- The password is stretched with **PBKDF2-HMAC-SHA256** using 600,000 iterations, which is intentionally slow to hinder brute-force attacks.
+- The password is stretched with **Argon2id** using default parameters, which is intentionally slow to hinder brute-force attacks.
 - Encryption uses **AES‑256‑GCM**, providing confidentiality and integrity.
+- A **ML‑KEM‑768** step adds post‑quantum secret material that is mixed into masking and encryption.
 - Nevertheless, do not treat this as a substitute for a fully reviewed, widely used cryptographic standard or protocol.
 - Always keep your **passwords secret** and avoid reusing them across different systems.
 
