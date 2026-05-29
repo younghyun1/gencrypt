@@ -8,7 +8,7 @@ use pqcrypto_mlkem::mlkem1024;
 use pqcrypto_traits::kem::{
     Ciphertext as KemCiphertext, SecretKey as KemSecretKey, SharedSecret as KemSharedSecret,
 };
-use rand::RngCore;
+use rand::Rng;
 use std::io::Cursor;
 use zstd::stream::{decode_all, encode_all};
 

@@ -81,7 +81,7 @@ impl Default for App {
 }
 
 fn validate_password(password: &str) -> Result<(), &'static str> {
-    if password.len() <= 10 {
+    if password.chars().count() <= 10 {
         return Err("Password must be > 10 chars");
     }
     let mut has_upper = false;
@@ -123,10 +123,12 @@ fn generate_secure_password() -> String {
     const CHARSET: &[u8] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>?";
 
+    // Rejection-sampling bound to eliminate modulo bias; constant for the fixed CHARSET.
+    let zone = usize::MAX - (usize::MAX % CHARSET.len());
+
     loop {
         let password: String = (0..20)
             .map(|_| {
-                let zone = usize::MAX - (usize::MAX % CHARSET.len());
                 loop {
                     let value = rng
                         .try_next_u64()
@@ -720,10 +722,14 @@ fn main() -> iced::Result {
         let out_path = if let Some(out) = output_path {
             out
         } else if decrypt_mode {
-            // Remove .gcy extension if present
+            // Remove .gcy extension if present; otherwise append .decrypted so we
+            // never overwrite the input file.
             let fname = match in_path_p.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.strip_suffix(".gcy").unwrap_or(n),
-                None => "output",
+                Some(n) => match n.strip_suffix(".gcy") {
+                    Some(stripped) => stripped.to_string(),
+                    None => format!("{n}.decrypted"),
+                },
+                None => "output".to_string(),
             };
             let out_path_buf = in_path_p.with_file_name(fname);
             out_path_buf.to_string_lossy().to_string()
