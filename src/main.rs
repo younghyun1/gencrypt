@@ -3,14 +3,15 @@
 mod crypto;
 
 use arboard::Clipboard;
+use iced::futures::SinkExt;
 use iced::widget::{
-    Space, button, column, container, row, scrollable, text, text_editor, text_input,
+    Space, button, column, container, progress_bar, row, scrollable, text, text_editor, text_input,
 };
 use iced::{Element, Length, Task};
 use mimalloc::MiMalloc;
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::crypto::{decode_custom, decode_custom_bytes, encode_custom, encode_custom_bytes};
 
@@ -27,15 +28,21 @@ pub enum Message {
     ToggleMode,
     Clear,
     SelectFile,
-    FileSelected(Option<std::path::PathBuf>),
-    SaveFileSelected(std::path::PathBuf, Option<std::path::PathBuf>),
-    OperationComplete(Result<String, String>),
+    FileSelected(Option<PathBuf>),
+    SaveFileSelected(PathBuf, Option<PathBuf>),
+    FileOperationUpdate(u64, FileOperationEvent),
     UpdateCryptoResult(u64, Result<(String, std::time::Duration), String>),
     GeneratePassword,
     CopyPassword,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
+pub enum FileOperationEvent {
+    Progress(f32),
+    Finished(Result<String, String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
     Encrypt,
     Decrypt,
@@ -50,6 +57,9 @@ pub struct App {
     last_duration: Option<std::time::Duration>,
     is_loading: bool,
     generation: u64,
+    file_generation: u64,
+    file_progress: Option<f32>,
+    is_file_processing: bool,
 }
 
 impl Default for App {
@@ -63,6 +73,9 @@ impl Default for App {
             last_duration: None,
             is_loading: false,
             generation: 0,
+            file_generation: 0,
+            file_progress: None,
+            is_file_processing: false,
         }
     }
 }
@@ -105,16 +118,24 @@ fn validate_password(password: &str) -> Result<(), &'static str> {
 }
 
 fn generate_secure_password() -> String {
-    use rand::Rng;
-    let mut rng = rand::rng();
-    let charset =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>?";
+    use rand::TryRng;
+    let mut rng = rand::rngs::SysRng;
+    const CHARSET: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>?";
 
     loop {
         let password: String = (0..20)
             .map(|_| {
-                let idx = rng.random_range(0..charset.len());
-                charset.chars().nth(idx).unwrap()
+                let zone = usize::MAX - (usize::MAX % CHARSET.len());
+                loop {
+                    let value = rng
+                        .try_next_u64()
+                        .expect("system random number generation failed")
+                        as usize;
+                    if value < zone {
+                        break CHARSET[value % CHARSET.len()] as char;
+                    }
+                }
             })
             .collect();
 
@@ -124,6 +145,105 @@ fn generate_secure_password() -> String {
     }
 }
 
+fn file_operation_task(
+    generation: u64,
+    in_path: PathBuf,
+    out_path: PathBuf,
+    password: String,
+    mode: Mode,
+) -> Task<Message> {
+    Task::run(
+        iced::stream::channel(16, async move |mut output| {
+            let start = std::time::Instant::now();
+            let _ = output.send(FileOperationEvent::Progress(2.0)).await;
+
+            let read_path = in_path.clone();
+            let bytes = match tokio::task::spawn_blocking(move || std::fs::read(read_path)).await {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(e)) => {
+                    let _ = output
+                        .send(FileOperationEvent::Finished(Err(format!(
+                            "Read failed: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = output
+                        .send(FileOperationEvent::Finished(Err(format!(
+                            "Read task failed: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+            let _ = output.send(FileOperationEvent::Progress(25.0)).await;
+
+            let processed = match tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+                match mode {
+                    Mode::Encrypt => Ok(encode_custom_bytes(&bytes, &password).into_bytes()),
+                    Mode::Decrypt => {
+                        let content = String::from_utf8_lossy(&bytes);
+                        decode_custom_bytes(&content, &password)
+                            .map_err(|e| format!("Decryption error: {e}"))
+                    }
+                }
+            })
+            .await
+            {
+                Ok(Ok(processed)) => processed,
+                Ok(Err(e)) => {
+                    let _ = output.send(FileOperationEvent::Finished(Err(e))).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = output
+                        .send(FileOperationEvent::Finished(Err(format!(
+                            "Crypto task failed: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+            let _ = output.send(FileOperationEvent::Progress(85.0)).await;
+
+            let write_path = out_path.clone();
+            match tokio::task::spawn_blocking(move || std::fs::write(write_path, processed)).await {
+                Ok(Ok(())) => {
+                    let _ = output.send(FileOperationEvent::Progress(100.0)).await;
+                    let action = if mode == Mode::Encrypt {
+                        "Encrypted"
+                    } else {
+                        "Decrypted"
+                    };
+                    let _ = output
+                        .send(FileOperationEvent::Finished(Ok(format!(
+                            "{action} to {:?} ({:.2?})",
+                            out_path,
+                            start.elapsed()
+                        ))))
+                        .await;
+                }
+                Ok(Err(e)) => {
+                    let _ = output
+                        .send(FileOperationEvent::Finished(Err(format!(
+                            "Write failed: {e}"
+                        ))))
+                        .await;
+                }
+                Err(e) => {
+                    let _ = output
+                        .send(FileOperationEvent::Finished(Err(format!(
+                            "Write task failed: {e}"
+                        ))))
+                        .await;
+                }
+            }
+        }),
+        move |event| Message::FileOperationUpdate(generation, event),
+    )
+}
+
 impl App {
     fn perform_crypto(&mut self) -> Task<Message> {
         self.is_loading = true;
@@ -131,7 +251,7 @@ impl App {
         self.generation += 1;
         let generation = self.generation;
 
-        let mode = self.mode.clone();
+        let mode = self.mode;
         let password = self.password.clone();
         let input = match mode {
             Mode::Encrypt => self.plaintext_content.text(),
@@ -208,18 +328,18 @@ impl App {
                 }
             }
             Message::PasteInput => {
-                if let Ok(mut clipboard) = Clipboard::new() {
-                    if let Ok(text) = clipboard.get_text() {
-                        match self.mode {
-                            Mode::Encrypt => {
-                                self.plaintext_content = text_editor::Content::with_text(&text);
-                            }
-                            Mode::Decrypt => {
-                                self.ciphertext_content = text_editor::Content::with_text(&text);
-                            }
+                if let Ok(mut clipboard) = Clipboard::new()
+                    && let Ok(text) = clipboard.get_text()
+                {
+                    match self.mode {
+                        Mode::Encrypt => {
+                            self.plaintext_content = text_editor::Content::with_text(&text);
                         }
-                        return self.perform_crypto();
+                        Mode::Decrypt => {
+                            self.ciphertext_content = text_editor::Content::with_text(&text);
+                        }
                     }
+                    return self.perform_crypto();
                 }
             }
             Message::CopyOutput => {
@@ -241,9 +361,13 @@ impl App {
             Message::Clear => {
                 self.plaintext_content = text_editor::Content::new();
                 self.ciphertext_content = text_editor::Content::new();
+                self.file_progress = None;
+                self.is_file_processing = false;
                 self.status = "Cleared".to_string();
             }
             Message::SelectFile => {
+                self.file_progress = None;
+                self.is_file_processing = false;
                 self.status = "Selecting input file...".to_string();
                 let dialog = if self.mode == Mode::Encrypt {
                     rfd::AsyncFileDialog::new()
@@ -291,6 +415,8 @@ impl App {
                     );
                 } else {
                     self.status = "File selection cancelled.".to_string();
+                    self.file_progress = None;
+                    self.is_file_processing = false;
                 }
             }
             Message::SaveFileSelected(in_path, out_opt) => {
@@ -302,7 +428,11 @@ impl App {
                         return Task::none();
                     }
 
-                    let mode = self.mode.clone();
+                    let mode = self.mode;
+                    self.file_generation += 1;
+                    let file_generation = self.file_generation;
+                    self.file_progress = Some(0.0);
+                    self.is_file_processing = true;
 
                     self.status = if mode == Mode::Encrypt {
                         "Encrypting..."
@@ -311,52 +441,35 @@ impl App {
                     }
                     .to_string();
 
-                    return Task::perform(
-                        async move {
-                            let start = std::time::Instant::now();
-                            match std::fs::read(&in_path) {
-                                Ok(bytes) => match mode {
-                                    Mode::Encrypt => {
-                                        let encrypted_str = encode_custom_bytes(&bytes, &password);
-                                        match std::fs::write(&out_path, encrypted_str.as_bytes()) {
-                                            Ok(_) => Ok(format!(
-                                                "Encrypted to {:?} ({:.2?})",
-                                                out_path,
-                                                start.elapsed()
-                                            )),
-                                            Err(e) => Err(format!("Write failed: {e}")),
-                                        }
-                                    }
-                                    Mode::Decrypt => {
-                                        let content = String::from_utf8_lossy(&bytes);
-                                        match decode_custom_bytes(&content, &password) {
-                                            Ok(decrypted_bytes) => {
-                                                match std::fs::write(&out_path, decrypted_bytes) {
-                                                    Ok(_) => Ok(format!(
-                                                        "Decrypted to {:?} ({:.2?})",
-                                                        out_path,
-                                                        start.elapsed()
-                                                    )),
-                                                    Err(e) => Err(format!("Write failed: {e}")),
-                                                }
-                                            }
-                                            Err(e) => Err(format!("Decryption error: {e}")),
-                                        }
-                                    }
-                                },
-                                Err(e) => Err(format!("Read failed: {e}")),
-                            }
-                        },
-                        Message::OperationComplete,
-                    );
+                    return file_operation_task(file_generation, in_path, out_path, password, mode);
                 } else {
                     self.status = "Output selection cancelled.".to_string();
+                    self.file_progress = None;
+                    self.is_file_processing = false;
                 }
             }
-            Message::OperationComplete(res) => match res {
-                Ok(msg) => self.status = msg,
-                Err(e) => self.status = format!("Error: {e}"),
-            },
+            Message::FileOperationUpdate(gen_id, event) => {
+                if gen_id == self.file_generation {
+                    match event {
+                        FileOperationEvent::Progress(progress) => {
+                            self.file_progress = Some(progress);
+                        }
+                        FileOperationEvent::Finished(res) => {
+                            self.is_file_processing = false;
+                            match res {
+                                Ok(msg) => {
+                                    self.file_progress = Some(100.0);
+                                    self.status = msg;
+                                }
+                                Err(e) => {
+                                    self.file_progress = None;
+                                    self.status = format!("Error: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Message::UpdateCryptoResult(gen_id, result) => {
                 if gen_id == self.generation {
                     self.is_loading = false;
@@ -446,12 +559,17 @@ impl App {
         ]
         .spacing(10);
 
+        let mut select_file_button = button("Select File");
+        if !self.is_file_processing {
+            select_file_button = select_file_button.on_press(Message::SelectFile);
+        }
+
         let top_section = column![
             row![
                 text(input_label).size(16),
                 button("Copy").on_press(Message::CopyInput),
                 button("Paste").on_press(Message::PasteInput),
-                button("Select File").on_press(Message::SelectFile),
+                select_file_button,
             ]
             .spacing(10)
             .align_y(iced::Alignment::Center),
@@ -484,6 +602,28 @@ impl App {
         .on_press(Message::ToggleMode);
 
         let clear_button = button("Clear All").on_press(Message::Clear);
+        let status_row = row![
+            text(&self.status).size(14),
+            Space::new().width(Length::Fill),
+            text(if let Some(d) = self.last_duration {
+                format!("Time: {:?}", d)
+            } else {
+                String::new()
+            })
+            .size(12)
+        ]
+        .width(Length::Fill)
+        .align_y(iced::Alignment::Center)
+        .padding(5);
+
+        let mut status_section = column![status_row].spacing(6).width(Length::Fill);
+        if let Some(progress) = self.file_progress {
+            status_section = status_section.push(
+                progress_bar(0.0..=100.0, progress)
+                    .girth(8)
+                    .length(Length::Fill),
+            );
+        }
 
         let content = column![
             container(text("GenCrypt").size(24)).center_x(Length::Fill),
@@ -492,19 +632,7 @@ impl App {
             top_section,
             bottom_section,
             container(clear_button).center_x(Length::Fill).padding(5),
-            row![
-                text(&self.status).size(14),
-                Space::new().width(Length::Fill),
-                text(if let Some(d) = self.last_duration {
-                    format!("Time: {:?}", d)
-                } else {
-                    String::new()
-                })
-                .size(12)
-            ]
-            .width(Length::Fill)
-            .align_y(iced::Alignment::Center)
-            .padding(5),
+            status_section,
         ]
         .spacing(20)
         .padding(20)
